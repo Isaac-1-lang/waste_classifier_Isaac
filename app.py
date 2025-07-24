@@ -11,8 +11,8 @@ from transformers import AutoImageProcessor, AutoModelForImageClassification
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load processor and model
-processor = AutoImageProcessor.from_pretrained("Isaac-1-lang/waste_classifier_Isaac")
-model = AutoModelForImageClassification.from_pretrained("Isaac-1-lang/waste_classifier_Isaac").to(device)
+processor = AutoImageProcessor.from_pretrained("Claudineuwa/waste_classifier_Isaac")
+model = AutoModelForImageClassification.from_pretrained("Claudineuwa/waste_classifier_Isaac").to(device)
 
 # Transform
 transform = transforms.Compose([
