@@ -7,6 +7,10 @@ import io
 import os
 import logging
 import gc
+import signal
+import resource
+import psutil
+from typing import Dict, Any, List
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -15,9 +19,15 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Load model from Hugging Face Hub
+# Configuration Constants
 MODEL_NAME = "Claudineuwa/waste_classifier_Isaac"
+MAX_IMAGES_PER_REQUEST = 5  # Limit to prevent memory overload
+MEMORY_LIMIT_PERCENTAGE = 0.8  # Use 80% of available memory
 
+# Type aliases
+PredictionResult = Dict[str, Any]
+
+# Label information
 LABEL2INFO = {
     0: {
         "label": "biodegradable",
@@ -25,9 +35,9 @@ LABEL2INFO = {
         "recyclable": False,
         "disposal": "Use compost or organic bin",
         "example_items": ["banana peel", "food waste", "paper"],
-        "environmental_benefit": "Composting biodegradable waste returns nutrients to the soil, reduces landfill use, and lowers greenhouse gas emissions.",
-        "protection_tip": "Compost at home or use municipal organic waste bins. Avoid mixing with plastics or hazardous waste.",
-        "poor_disposal_effects": "If disposed of improperly, biodegradable waste can cause methane emissions in landfills and contribute to water pollution and eutrophication."
+        "environmental_benefit": "Composting biodegradable waste returns nutrients to the soil.",
+        "protection_tip": "Compost at home or use municipal organic waste bins.",
+        "poor_disposal_effects": "Can cause methane emissions in landfills."
     },
     1: {
         "label": "non_biodegradable",
@@ -35,194 +45,204 @@ LABEL2INFO = {
         "recyclable": False,
         "disposal": "Use general waste bin or recycling if possible",
         "example_items": ["plastic bag", "styrofoam", "metal can"],
-        "environmental_benefit": "Proper disposal and recycling of non-biodegradable waste reduces pollution, conserves resources, and protects wildlife.",
-        "protection_tip": "Reduce use, reuse items, and recycle whenever possible. Never burn or dump in nature.",
-        "poor_disposal_effects": "Improper disposal leads to soil and water pollution, harms wildlife, and causes long-term environmental damage. Plastics can persist for hundreds of years."
+        "environmental_benefit": "Proper disposal reduces pollution and protects wildlife.",
+        "protection_tip": "Reduce use, reuse items, and recycle whenever possible.",
+        "poor_disposal_effects": "Leads to soil and water pollution, harms wildlife."
     }
 }
 
 # Global variables for model and processor
-model = None
-image_processor = None
+model: Any = None
+image_processor: Any = None
 
-def load_model():
-    """Load the model from Hugging Face Hub with memory optimization"""
+def set_memory_limit() -> None:
+    """Set memory limits to prevent OOM errors"""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        total_mem = psutil.virtual_memory().total
+        new_limit = int(total_mem * MEMORY_LIMIT_PERCENTAGE)
+        resource.setrlimit(resource.RLIMIT_AS, (new_limit, hard))
+        logger.info(f"Set memory limit to {new_limit/1024/1024:.2f} MB")
+    except Exception as e:
+        logger.warning(f"Could not set memory limits: {e}")
+
+def cleanup(signum=None, frame=None) -> None:
+    """Handle signals to clean up memory"""
     global model, image_processor
     
-    logger.info(f"Attempting to load model from Hugging Face: {MODEL_NAME}")
-    
-    # Clear any existing memory before loading
-    if 'model' in globals() and model is not None:
+    logger.info("Performing memory cleanup...")
+    if model is not None:
+        model.cpu()
         del model
-    if 'image_processor' in globals() and image_processor is not None:
+    if image_processor is not None:
         del image_processor
+        
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    
+    logger.info("Cleanup completed")
 
-    # Load model and processor from Hugging Face Hub
+def load_model() -> bool:
+    """Load the model with memory optimization"""
+    global model, image_processor
+    
+    # Clean up existing resources
+    cleanup()
+    
     try:
-        logger.info("Loading model from Hugging Face Hub with memory optimization...")
+        logger.info(f"Loading model {MODEL_NAME} with memory optimization...")
         
-        # Try loading from Hugging Face Hub
-        try:
-            model = AutoModelForImageClassification.from_pretrained(
-                MODEL_NAME,
-                torch_dtype=torch.float16,  # Use half precision to save memory
-                low_cpu_mem_usage=True,     # Enable memory optimization
-                device_map="auto" if torch.cuda.is_available() else None
-            )
-            logger.info("Successfully loaded as AutoModelForImageClassification from HF Hub")
-        except (ValueError, OSError) as e:
-            logger.warning(f"Failed to load as ImageClassification model: {e}")
-            logger.info("Trying with maximum memory optimization...")
-            
-            try:
-                # Try with even more aggressive memory settings
-                model = AutoModelForImageClassification.from_pretrained(
-                    MODEL_NAME,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    max_memory={0: "1GB", "cpu": "2GB"} if torch.cuda.is_available() else {"cpu": "2GB"}
-                )
-                logger.info("Loaded with maximum memory optimization from HF Hub")
-            except Exception as e2:
-                logger.warning(f"Failed with memory optimization: {e2}")
-                # If it's an OPT model or other type, try loading it differently
-                from transformers import AutoModel
-                model = AutoModel.from_pretrained(
-                    MODEL_NAME,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True
-                )
-                logger.info("Loaded as AutoModel with memory optimization from HF Hub")
+        # Load with aggressive memory settings
+        model = AutoModelForImageClassification.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="auto" if torch.cuda.is_available() else None,
+            offload_folder="offload",
+            offload_state_dict=True
+        )
         
-        logger.info("Loading image processor from Hugging Face Hub...")
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-            logger.info("Successfully loaded AutoImageProcessor from HF Hub")
-        except Exception as e:
-            logger.warning(f"Failed to load AutoImageProcessor: {e}")
-            # Try alternative processors
-            from transformers import AutoProcessor
-            image_processor = AutoProcessor.from_pretrained(MODEL_NAME)
-            logger.info("Successfully loaded AutoProcessor from HF Hub")
+        # Load processor
+        image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
         
+        # Set to eval mode and move to GPU if available
         model.eval()
-        
-        # Force garbage collection after loading
-        gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            model = model.to('cuda')
             
-        logger.info("Model and processor loaded successfully from Hugging Face Hub!")
+        logger.info("Model loaded successfully")
         return True
         
     except Exception as e:
-        logger.error(f"Error loading model from Hugging Face Hub: {e}")
-        logger.info("Make sure your Hugging Face repository is public or you have proper authentication")
+        logger.error(f"Error loading model: {e}")
+        cleanup()
         return False
 
-def predict_image(image_bytes, device="cpu"):
+def predict_image(image_bytes: bytes, device: str = "cpu") -> PredictionResult:
     """Predict image classification with memory management"""
     if model is None or image_processor is None:
-        raise RuntimeError("Model not loaded properly")
+        raise RuntimeError("Model not loaded")
     
     try:
-        # Clear memory before prediction
-        gc.collect()
-        
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        inputs = image_processor(images=image, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
+        # Use context manager for automatic cleanup
+        with torch.inference_mode():
+            # Process image
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            inputs = image_processor(images=image, return_tensors="pt")
+            
+            # Move only necessary tensors to device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Predict
             outputs = model(**inputs)
-            probs = torch.softmax(outputs.logits, dim=1)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
             conf, pred = torch.max(probs, dim=1)
-            label_id = pred.item()
-            confidence = conf.item()
-        
-        # Clear inputs from memory
-        del inputs, outputs, probs
-        gc.collect()
-        
-        info = LABEL2INFO[label_id].copy()
-        info["confidence"] = round(confidence, 2)
-        info["eco_points_earned"] = 10  # Dummy value
-        return info
-        
+            
+            # Convert to CPU numpy immediately
+            label_id = pred.cpu().numpy()[0]
+            confidence = conf.cpu().item()
+            
+            # Get result
+            result = LABEL2INFO[label_id].copy()
+            result["confidence"] = round(confidence, 2)
+            return result
+            
     except Exception as e:
-        logger.error(f"Error in prediction: {e}")
-        # Clear memory on error
-        gc.collect()
+        logger.error(f"Prediction error: {e}")
         raise
+    finally:
+        # Ensure cleanup even if error occurs
+        del inputs, outputs, probs, conf, pred if 'inputs' in locals() else None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 @app.route('/', methods=['GET'])
-def health_check():
+def health_check() -> Dict[str, Any]:
     """Health check endpoint"""
     return jsonify({
-        "status": "healthy", 
+        "status": "healthy",
         "model_loaded": model is not None,
-        "processor_loaded": image_processor is not None,
-        "model_name": MODEL_NAME
+        "memory": {
+            "available": psutil.virtual_memory().available / (1024**2),
+            "used": psutil.virtual_memory().used / (1024**2),
+            "percent": psutil.virtual_memory().percent
+        }
     })
 
 @app.route('/classify', methods=['POST'])
-def classify():
+def classify() -> Any:
     """Classification endpoint with memory management"""
-    if model is None or image_processor is None:
-        return jsonify({"error": "Model not loaded"}), 500
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 503
     
     try:
-        results = []
-        files = request.files.getlist('images')
-        
+        # Limit number of images processed
+        files = request.files.getlist('images')[:MAX_IMAGES_PER_REQUEST]
         if not files:
             return jsonify({"error": "No images provided"}), 400
         
+        results = []
         for file in files:
-            if file.filename == '':
+            if not file.filename:
                 continue
-            image_bytes = file.read()
-            result = predict_image(image_bytes)
-            results.append(result)
-            
-            # Clear memory between predictions
-            gc.collect()
-        
-        return jsonify({"results": results})
+                
+            try:
+                image_bytes = file.read()
+                result = predict_image(image_bytes)
+                results.append(result)
+                
+                # Immediate cleanup
+                del image_bytes
+                gc.collect()
+                
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {e}")
+                continue
+                
+        return jsonify({
+            "results": results,
+            "processed_count": len(results),
+            "warning": f"Limited to first {MAX_IMAGES_PER_REQUEST} images" if len(request.files.getlist('images')) > MAX_IMAGES_PER_REQUEST else None
+        })
         
     except Exception as e:
-        logger.error(f"Error in classify: {e}")
-        # Clear memory on error
-        gc.collect()
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Classification error: {e}")
+        return jsonify({"error": "Processing error"}), 500
+    finally:
+        cleanup()
 
 @app.route('/memory-status', methods=['GET'])
-def memory_status():
-    """Check memory usage - useful for debugging"""
-    try:
-        import psutil
-        memory = psutil.virtual_memory()
-        return jsonify({
-            "total_memory_gb": round(memory.total / (1024**3), 2),
-            "available_memory_gb": round(memory.available / (1024**3), 2),
-            "used_memory_percent": memory.percent,
-            "model_loaded": model is not None
-        })
-    except ImportError:
-        return jsonify({"error": "psutil not available for memory monitoring"})
+def memory_status() -> Dict[str, Any]:
+    """Detailed memory status endpoint"""
+    mem = psutil.virtual_memory()
+    return jsonify({
+        "total_memory_gb": round(mem.total / (1024**3), 2),
+        "available_memory_gb": round(mem.available / (1024**3), 2),
+        "used_memory_percent": mem.percent,
+        "model_loaded": model is not None,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_memory": torch.cuda.memory_allocated() / (1024**2) if torch.cuda.is_available() else 0
+    })
 
-# Initialize the model when the app starts
-logger.info("Starting Flask app with memory optimization...")
-model_loaded = load_model()
+# Register signal handlers
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
 
-if not model_loaded:
-    logger.warning("App starting without model - some features may not work")
-
+# Initialize
 if __name__ == '__main__':
-    # Use environment PORT for deployment, fallback to 5000 for local
-    port = int(os.environ.get("PORT", 5000))
-    # Bind to 0.0.0.0 for deployment, disable debug in production
-    app.run(host="0.0.0.0", port=port, debug=False)
+    try:
+        set_memory_limit()
+        if not load_model():
+            logger.error("Failed to load model - exiting")
+            exit(1)
+            
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port, debug=False)
+    except Exception as e:
+        logger.error(f"Failed to start app: {e}")
+        cleanup()
+        exit(1)
