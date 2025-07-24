@@ -1,0 +1,11 @@
+model.safetensors
+config.json
+preprocessor_config.json
+*.bin
+*.pt
+*.pth
+.gitmodules
+__pycache__/
+.env
+.venv/
+venv
