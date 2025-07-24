@@ -6,6 +6,7 @@ preprocessor_config.json
 *.pth
 .gitmodules
 __pycache__/
-.env
 .venv/
 venv
+config.bat
+node_modules
